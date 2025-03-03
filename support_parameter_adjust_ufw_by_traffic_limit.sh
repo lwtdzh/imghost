@@ -1,5 +1,3 @@
-
-
 #!/bin/bash
 
 # support_parameter_adjust_ufw_by_traffic_limit.sh
