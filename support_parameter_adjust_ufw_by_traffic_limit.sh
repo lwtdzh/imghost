@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
 # Enable a reversible UFW traffic block when the current month's vnStat
-# usage exceeds a configured limit. The script never resets unrelated UFW
-# rules and always installs an IPv4/IPv6 TCP port 22 allow rule first.
+# upload, download, or total usage reaches a configured limit. The script
+# never resets unrelated UFW rules and always installs an IPv4/IPv6 TCP
+# port 22 allow rule first.
 #
-# Cron example:
-# */5 * * * * /bin/bash /root/support_parameter_adjust_ufw_by_traffic_limit.sh -l 180g > /root/traffic_limit.log 2>&1
+# Cron examples:
+# */5 * * * * /bin/bash /root/support_parameter_adjust_ufw_by_traffic_limit.sh -u 100g > /root/traffic_limit.log 2>&1
+# */5 * * * * /bin/bash /root/support_parameter_adjust_ufw_by_traffic_limit.sh -u 100g -d 10g -l 105g > /root/traffic_limit.log 2>&1
 
 set -u
 set -o pipefail
@@ -20,7 +22,10 @@ readonly BLOCK_IN_COMMENT="traffic-limit:block-in"
 readonly BLOCK_OUT_COMMENT="traffic-limit:block-out"
 
 INTERFACE="${TRAFFIC_LIMIT_INTERFACE:-}"
-FLOW_MONTHLY_LIMIT_BYTES=""
+UPLOAD_LIMIT_BYTES=""
+DOWNLOAD_LIMIT_BYTES=""
+TOTAL_LIMIT_BYTES=""
+LIMIT_OPTION_SEEN=0
 DRY_RUN=0
 
 log() {
@@ -38,13 +43,22 @@ Usage:
   support_parameter_adjust_ufw_by_traffic_limit.sh [options]
 
 Options:
-  -l, --limit VALUE       Monthly total traffic limit. Integer plus optional
-                          B/K/M/G/T, KB/MB/GB/TB, or KiB/MiB/GiB/TiB suffix.
-                          A number without a suffix is interpreted as GiB.
+  -u, --upload-limit VALUE
+                          Monthly upload limit (vnStat tx).
+  -d, --download-limit VALUE
+                          Monthly download limit (vnStat rx).
+  -l, --limit VALUE
+      --total-limit VALUE Monthly upload + download limit. --limit is retained
+                          for backward compatibility.
   -i, --interface NAME    Network interface monitored by vnStat. Defaults to
                           the interface carrying the default route.
       --dry-run           Report the decision without changing UFW.
   -h, --help              Show this help.
+
+Limit values are positive integers with an optional B/K/M/G/T, KB/MB/GB/TB,
+or KiB/MiB/GiB/TiB suffix. Units are binary; a value without a suffix is GiB.
+Only explicitly supplied limit types are enabled. If no limit is supplied,
+the backward-compatible default total limit is 180 GiB.
 EOF
 }
 
@@ -78,10 +92,25 @@ convert_to_bytes() {
 
 while (($# > 0)); do
   case "$1" in
-    -l|--limit)
+    -u|--upload-limit|--tx-limit)
       (($# >= 2)) || die "$1 requires a value"
-      FLOW_MONTHLY_LIMIT_BYTES=$(convert_to_bytes "$2") ||
-        die "invalid limit '$2'; expected a positive integer with an optional B/K/M/G/T suffix"
+      UPLOAD_LIMIT_BYTES=$(convert_to_bytes "$2") ||
+        die "invalid upload limit '$2'; expected a positive integer with an optional B/K/M/G/T suffix"
+      LIMIT_OPTION_SEEN=1
+      shift 2
+      ;;
+    -d|--download-limit|--rx-limit)
+      (($# >= 2)) || die "$1 requires a value"
+      DOWNLOAD_LIMIT_BYTES=$(convert_to_bytes "$2") ||
+        die "invalid download limit '$2'; expected a positive integer with an optional B/K/M/G/T suffix"
+      LIMIT_OPTION_SEEN=1
+      shift 2
+      ;;
+    -l|--limit|--total-limit)
+      (($# >= 2)) || die "$1 requires a value"
+      TOTAL_LIMIT_BYTES=$(convert_to_bytes "$2") ||
+        die "invalid total limit '$2'; expected a positive integer with an optional B/K/M/G/T suffix"
+      LIMIT_OPTION_SEEN=1
       shift 2
       ;;
     -i|--interface)
@@ -104,8 +133,8 @@ while (($# > 0)); do
   esac
 done
 
-if [[ -z $FLOW_MONTHLY_LIMIT_BYTES ]]; then
-  FLOW_MONTHLY_LIMIT_BYTES=$(convert_to_bytes "${DEFAULT_FLOW_LIMIT_GIB}G") ||
+if ((LIMIT_OPTION_SEEN == 0)); then
+  TOTAL_LIMIT_BYTES=$(convert_to_bytes "${DEFAULT_FLOW_LIMIT_GIB}G") ||
     die "invalid built-in default limit"
 fi
 
@@ -260,7 +289,7 @@ detect_interface() {
   printf '%s\n' "$detected"
 }
 
-get_monthly_total_bytes() {
+get_monthly_usage_bytes() {
   local raw rc
   local -a fields
   local current_month
@@ -274,8 +303,10 @@ get_monthly_total_bytes() {
   rc=$?
 
   if [[ $raw == *"Not enough data available yet"* ]]; then
-    FLOW_MONTH_TOTAL_READABLE="0 B (vnStat has insufficient data)"
-    FLOW_MONTH_TOTAL_BYTES=0
+    MONTHLY_UPLOAD_BYTES=0
+    MONTHLY_DOWNLOAD_BYTES=0
+    MONTHLY_TOTAL_BYTES=0
+    VNSTAT_DATA_NOTE=" (vnStat has insufficient data)"
     return 0
   fi
   if ((rc != 0)); then
@@ -290,13 +321,17 @@ get_monthly_total_bytes() {
   fi
 
   current_month=$(date '+%Y-%m')
-  if [[ ${fields[7]} != "$current_month" || ! ${fields[10]} =~ ^[0-9]+$ ]]; then
+  if [[ ${fields[7]} != "$current_month" ||
+        ! ${fields[8]} =~ ^[0-9]+$ ||
+        ! ${fields[9]} =~ ^[0-9]+$ ||
+        ! ${fields[10]} =~ ^[0-9]+$ ]]; then
     TRAFFIC_ERROR="vnstat current-month fields are invalid: $raw"
     return 1
   fi
 
-  FLOW_MONTH_TOTAL_READABLE="${fields[10]} B"
-  FLOW_MONTH_TOTAL_BYTES=${fields[10]}
+  MONTHLY_DOWNLOAD_BYTES=${fields[8]}
+  MONTHLY_UPLOAD_BYTES=${fields[9]}
+  MONTHLY_TOTAL_BYTES=${fields[10]}
 }
 
 if [[ -z $INTERFACE ]]; then
@@ -307,27 +342,63 @@ if [[ -z $INTERFACE ]]; then
 fi
 
 TRAFFIC_ERROR=${TRAFFIC_ERROR:-}
-FLOW_MONTH_TOTAL_READABLE=""
-FLOW_MONTH_TOTAL_BYTES=""
+MONTHLY_UPLOAD_BYTES=""
+MONTHLY_DOWNLOAD_BYTES=""
+MONTHLY_TOTAL_BYTES=""
+VNSTAT_DATA_NOTE=""
 
 if [[ -z $TRAFFIC_ERROR ]]; then
-  get_monthly_total_bytes || true
+  get_monthly_usage_bytes || true
 fi
 
-if [[ -n $TRAFFIC_ERROR || ! $FLOW_MONTH_TOTAL_BYTES =~ ^[0-9]+$ ]]; then
-  [[ -n $TRAFFIC_ERROR ]] || TRAFFIC_ERROR="monthly traffic value is invalid"
+if [[ -n $TRAFFIC_ERROR ||
+      ! $MONTHLY_UPLOAD_BYTES =~ ^[0-9]+$ ||
+      ! $MONTHLY_DOWNLOAD_BYTES =~ ^[0-9]+$ ||
+      ! $MONTHLY_TOTAL_BYTES =~ ^[0-9]+$ ]]; then
+  [[ -n $TRAFFIC_ERROR ]] || TRAFFIC_ERROR="one or more monthly traffic values are invalid"
   log "CRITICAL: $TRAFFIC_ERROR"
   log "fail-safe decision: entering block mode"
   enter_block_mode
   exit 2
 fi
 
-log "interface=$INTERFACE monthly_total=${FLOW_MONTH_TOTAL_READABLE} limit=${FLOW_MONTHLY_LIMIT_BYTES} B"
+format_limit() {
+  local value=$1
+  if [[ -n $value ]]; then
+    printf '%s B' "$value"
+  else
+    printf 'disabled'
+  fi
+}
 
-if ((FLOW_MONTH_TOTAL_BYTES > FLOW_MONTHLY_LIMIT_BYTES)); then
-  log "monthly traffic exceeds the limit"
+log "interface=$INTERFACE upload=${MONTHLY_UPLOAD_BYTES} B download=${MONTHLY_DOWNLOAD_BYTES} B total=${MONTHLY_TOTAL_BYTES} B${VNSTAT_DATA_NOTE}"
+log "limits: upload=$(format_limit "$UPLOAD_LIMIT_BYTES") download=$(format_limit "$DOWNLOAD_LIMIT_BYTES") total=$(format_limit "$TOTAL_LIMIT_BYTES")"
+
+TRIGGER_REASONS=""
+add_trigger_reason() {
+  if [[ -n $TRIGGER_REASONS ]]; then
+    TRIGGER_REASONS+="; "
+  fi
+  TRIGGER_REASONS+=$1
+}
+
+if [[ -n $UPLOAD_LIMIT_BYTES ]] &&
+   ((MONTHLY_UPLOAD_BYTES >= UPLOAD_LIMIT_BYTES)); then
+  add_trigger_reason "upload ${MONTHLY_UPLOAD_BYTES} >= ${UPLOAD_LIMIT_BYTES}"
+fi
+if [[ -n $DOWNLOAD_LIMIT_BYTES ]] &&
+   ((MONTHLY_DOWNLOAD_BYTES >= DOWNLOAD_LIMIT_BYTES)); then
+  add_trigger_reason "download ${MONTHLY_DOWNLOAD_BYTES} >= ${DOWNLOAD_LIMIT_BYTES}"
+fi
+if [[ -n $TOTAL_LIMIT_BYTES ]] &&
+   ((MONTHLY_TOTAL_BYTES >= TOTAL_LIMIT_BYTES)); then
+  add_trigger_reason "total ${MONTHLY_TOTAL_BYTES} >= ${TOTAL_LIMIT_BYTES}"
+fi
+
+if [[ -n $TRIGGER_REASONS ]]; then
+  log "traffic limit reached: $TRIGGER_REASONS"
   enter_block_mode
 else
-  log "monthly traffic is within the limit"
+  log "all enabled traffic limits are below their thresholds"
   leave_block_mode
 fi
