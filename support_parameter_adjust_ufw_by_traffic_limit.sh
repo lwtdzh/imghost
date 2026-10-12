@@ -1,163 +1,333 @@
-#!/bin/bash
-
-# support_parameter_adjust_ufw_by_traffic_limit.sh
+#!/usr/bin/env bash
+#
+# Enable a reversible UFW traffic block when the current month's vnStat
+# usage exceeds a configured limit. The script never resets unrelated UFW
+# rules and always installs an IPv4/IPv6 TCP port 22 allow rule first.
+#
+# Cron example:
 # */5 * * * * /bin/bash /root/support_parameter_adjust_ufw_by_traffic_limit.sh -l 180g > /root/traffic_limit.log 2>&1
 
-# 当前时间
-CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S %Z')
+set -u
+set -o pipefail
 
-# 默认的流量总额限制（如果没有指定）
-DEFAULT_FLOW_LIMIT_GIB=180
+readonly DEFAULT_FLOW_LIMIT_GIB=180
+readonly SSH_PORT=22
+readonly STATE_DIR="${TRAFFIC_LIMIT_STATE_DIR:-/var/lib/traffic-limit-ufw}"
+readonly STATE_FILE="${STATE_DIR}/state"
+readonly LOCK_FILE="${TRAFFIC_LIMIT_LOCK_FILE:-/run/lock/traffic-limit-ufw.lock}"
+readonly SSH_COMMENT="traffic-limit:ssh-keepalive"
+readonly BLOCK_IN_COMMENT="traffic-limit:block-in"
+readonly BLOCK_OUT_COMMENT="traffic-limit:block-out"
 
-# 配置你的网络接口
-INTERFACE="ens4"
+INTERFACE="${TRAFFIC_LIMIT_INTERFACE:-}"
+FLOW_MONTHLY_LIMIT_BYTES=""
+DRY_RUN=0
 
-# -----------------------------------------------------------
-# Function to convert given limit to bytes
-# -----------------------------------------------------------
-convert_to_bytes() {
-  local value=$1
-  case ${value: -1} in
-    G|g) echo "$(echo "${value%?} * 1024 * 1024 * 1024" | bc)" ;;
-    M|m) echo "$(echo "${value%?} * 1024 * 1024" | bc)" ;;
-    K|k) echo "$(echo "${value%?} * 1024" | bc)" ;;
-    B|b) echo "${value%?}" ;;
-    [0-9]) echo "$(echo "$value * 1024 * 1024 * 1024" | bc)" ;; # Default GiB
-    *) echo "Invalid limit format"; exit 1 ;;
-  esac
+log() {
+  printf '%s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$*"
 }
 
-# -----------------------------------------------------------
-# Processing input parameters
-# -----------------------------------------------------------
-FLOW_MONTHLY_LIMIT_BYTES=""
-while [[ "$#" -gt 0 ]]; do
-  case $1 in
+die() {
+  log "ERROR: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  support_parameter_adjust_ufw_by_traffic_limit.sh [options]
+
+Options:
+  -l, --limit VALUE       Monthly total traffic limit. Integer plus optional
+                          B/K/M/G/T, KB/MB/GB/TB, or KiB/MiB/GiB/TiB suffix.
+                          A number without a suffix is interpreted as GiB.
+  -i, --interface NAME    Network interface monitored by vnStat. Defaults to
+                          the interface carrying the default route.
+      --dry-run           Report the decision without changing UFW.
+  -h, --help              Show this help.
+EOF
+}
+
+convert_to_bytes() {
+  local raw
+  local number suffix factor
+
+  raw=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+  if [[ ! $raw =~ ^([0-9]+)(B|K|KB|KIB|M|MB|MIB|G|GB|GIB|T|TB|TIB)?$ ]]; then
+    return 1
+  fi
+
+  number=${BASH_REMATCH[1]}
+  suffix=${BASH_REMATCH[2]}
+  ((${#number} <= 10)) || return 1
+  case "$suffix" in
+    B) factor=1 ;;
+    K|KB|KIB) factor=1024 ;;
+    M|MB|MIB) factor=$((1024 ** 2)) ;;
+    ""|G|GB|GIB) factor=$((1024 ** 3)) ;;
+    T|TB|TIB) factor=$((1024 ** 4)) ;;
+    *) return 1 ;;
+  esac
+
+  # Force base 10 and reject signed 64-bit overflow.
+  number=$((10#$number))
+  ((number > 0)) || return 1
+  ((number <= 9223372036854775807 / factor)) || return 1
+  printf '%d\n' "$((number * factor))"
+}
+
+while (($# > 0)); do
+  case "$1" in
     -l|--limit)
-      if [[ -n $2 ]]; then
-        FLOW_MONTHLY_LIMIT_BYTES=$(convert_to_bytes "$2")
-        shift
-      else
-        echo "Error: --limit requires a non-empty argument."
-        exit 1
-      fi
+      (($# >= 2)) || die "$1 requires a value"
+      FLOW_MONTHLY_LIMIT_BYTES=$(convert_to_bytes "$2") ||
+        die "invalid limit '$2'; expected a positive integer with an optional B/K/M/G/T suffix"
+      shift 2
+      ;;
+    -i|--interface)
+      (($# >= 2)) || die "$1 requires a value"
+      [[ -n $2 && $2 != -* ]] || die "$1 requires a valid interface name"
+      INTERFACE=$2
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
       ;;
     *)
-      echo "Error: Unknown parameter passed: $1"
-      exit 1
+      die "unknown parameter '$1'"
       ;;
   esac
-  shift
 done
 
 if [[ -z $FLOW_MONTHLY_LIMIT_BYTES ]]; then
-  FLOW_MONTHLY_LIMIT_BYTES=$(convert_to_bytes "${DEFAULT_FLOW_LIMIT_GIB}G")
+  FLOW_MONTHLY_LIMIT_BYTES=$(convert_to_bytes "${DEFAULT_FLOW_LIMIT_GIB}G") ||
+    die "invalid built-in default limit"
 fi
 
-# -----------------------------------------------------------
-# 核心逻辑修改：数据获取与异常处理
-# -----------------------------------------------------------
+((EUID == 0)) || die "run this script as root"
+command -v flock >/dev/null 2>&1 || die "flock is required"
+command -v ufw >/dev/null 2>&1 || die "ufw is required; no firewall state was changed"
 
-# 1. 捕获 vnstat 的完整输出（包括标准错误 stderr）
-VNSTAT_RAW_OUTPUT=$(vnstat -m -i "$INTERFACE" 2>&1)
+mkdir -p "$STATE_DIR" || die "cannot create state directory '$STATE_DIR'"
+chmod 700 "$STATE_DIR" || die "cannot protect state directory '$STATE_DIR'"
 
-# 初始化变量
-FLOW_MONTH_TOTAL_BYTES=""
-FLOW_MONTH_TOTAL_READABLE=""
+exec 9>"$LOCK_FILE" || die "cannot open lock file '$LOCK_FILE'"
+if ! flock -n 9; then
+  log "another instance is running; skipping this invocation"
+  exit 0
+fi
 
-# 2. 定义特定的“数据不足”字符串 (精确匹配你提供的错误特征)
-NOT_ENOUGH_DATA_MSG="Not enough data available yet"
+ufw_is_active() {
+  LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active$'
+}
 
-if [[ "$VNSTAT_RAW_OUTPUT" == *"$NOT_ENOUGH_DATA_MSG"* ]]; then
-    # =======================================================
-    # 情况 A：数据不足 (vnstat 刚安装) -> 处理为【未超标】
-    # =======================================================
-    echo "===================================================================="
-    echo "${CURRENT_TIME}: [FALLBACK MODE] 检测到 vnstat 数据不足 ($NOT_ENOUGH_DATA_MSG)"
-    echo "${CURRENT_TIME}: >>> 触发兜底逻辑：默认流量未超标，保持连接畅通 <<<"
-    echo "===================================================================="
-    
-    FLOW_MONTH_TOTAL_BYTES=0
-    FLOW_MONTH_TOTAL_READABLE="0 (No Data)"
+ufw_rule_exists() {
+  local marker=$1
+  LC_ALL=C ufw show added 2>/dev/null | grep -Fq "comment '$marker'"
+}
 
-else
-    # =======================================================
-    # 情况 B：尝试正常解析数据
-    # =======================================================
-    CURRENT_MONTH_STR=$(date +%Y-%m)
-    # 尝试提取当月数据行
-    DATA_LINE=$(echo "$VNSTAT_RAW_OUTPUT" | grep "$CURRENT_MONTH_STR")
-    
-    if [[ -n "$DATA_LINE" ]]; then
-        # 提取成功
-        FLOW_MONTH_TOTAL_READABLE=$(echo "$DATA_LINE" | awk '{print $8, $9}')
-        # 计算字节数
-        FLOW_MONTH_TOTAL_BYTES=$(echo "$FLOW_MONTH_TOTAL_READABLE" | sed 's/KiB/*1024/; s/MiB/*1024^2/; s/GiB/*1024^3/; s/TiB/*1024^4/; s/B\>//' | bc)
+run_ufw() {
+  if ((DRY_RUN)); then
+    printf 'DRY-RUN: ufw'
+    printf ' %q' "$@"
+    printf '\n'
+    return 0
+  fi
+  ufw "$@"
+}
+
+ensure_ssh_rule() {
+  if ! ufw_rule_exists "$SSH_COMMENT"; then
+    # This rule is added before any deny rule and retained permanently.
+    run_ufw prepend allow in proto tcp to any port "$SSH_PORT" \
+      comment "$SSH_COMMENT" ||
+      die "failed to install the mandatory TCP port $SSH_PORT allow rule"
+  fi
+}
+
+ensure_block_rule() {
+  local direction=$1
+  local position=$2
+  local marker=$3
+  local endpoint_keyword
+
+  if [[ $direction == in ]]; then
+    endpoint_keyword=from
+  else
+    endpoint_keyword=to
+  fi
+  if ! ufw_rule_exists "$marker"; then
+    run_ufw insert "$position" deny "$direction" "$endpoint_keyword" any \
+      comment "$marker" ||
+      die "failed to install managed $direction block rule"
+  fi
+}
+
+delete_managed_rule() {
+  local direction=$1
+  local marker=$2
+  local endpoint_keyword
+
+  if [[ $direction == in ]]; then
+    endpoint_keyword=from
+  else
+    endpoint_keyword=to
+  fi
+  if ufw_rule_exists "$marker"; then
+    run_ufw --force delete deny "$direction" "$endpoint_keyword" any \
+      comment "$marker" ||
+      die "failed to remove managed $direction block rule"
+  fi
+}
+
+write_prior_state() {
+  local was_active=$1
+  local temporary="${STATE_FILE}.tmp.$$"
+
+  printf 'ufw_was_active=%s\n' "$was_active" >"$temporary" ||
+    die "cannot write state file"
+  chmod 600 "$temporary" || die "cannot protect state file"
+  mv -f "$temporary" "$STATE_FILE" || die "cannot install state file"
+}
+
+read_prior_state() {
+  local line
+  [[ -f $STATE_FILE ]] || return 1
+  IFS= read -r line <"$STATE_FILE" || return 1
+  case "$line" in
+    ufw_was_active=0) printf '0\n' ;;
+    ufw_was_active=1) printf '1\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+enter_block_mode() {
+  local was_active=0
+
+  if [[ ! -f $STATE_FILE ]]; then
+    ufw_is_active && was_active=1
+    if ((!DRY_RUN)); then
+      write_prior_state "$was_active"
+    else
+      log "DRY-RUN: would record prior UFW active state as $was_active"
     fi
-fi
-
-# =======================================================
-# 情况 C：异常检查 (Fail-safe)
-# 如果经过上面的步骤，FLOW_MONTH_TOTAL_BYTES 依然为空
-# 说明发生了其他错误 (如日期匹配失败、vnstat 命令报错但不是"数据不足")
-# -> 处理为【已超标】(安全阻断)
-# =======================================================
-if [[ -z "$FLOW_MONTH_TOTAL_BYTES" ]]; then
-    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    echo "${CURRENT_TIME}: [CRITICAL ERROR] 无法获取或解析流量数据！"
-    echo "原始输出: $VNSTAT_RAW_OUTPUT"
-    echo "${CURRENT_TIME}: >>> 触发安全阻断：视作流量已超标，强制开启防火墙 <<<"
-    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    
-    # 将当前流量设为一个不可能的大数，强制触发下方的超标逻辑
-    FLOW_MONTH_TOTAL_BYTES=$(echo "$FLOW_MONTHLY_LIMIT_BYTES + 1024" | bc)
-    FLOW_MONTH_TOTAL_READABLE="UNKNOWN (Error)"
-fi
-
-
-# -----------------------------------------------------------
-# 防火墙执行逻辑
-# -----------------------------------------------------------
-
-echo "${CURRENT_TIME}: 当前使用流量：${FLOW_MONTH_TOTAL_READABLE}，限制量：$(echo "$FLOW_MONTHLY_LIMIT_BYTES / 1024^3" | bc)GiB"
-
-# 判断当前流量是否大于限制量
-if [ "$(echo "$FLOW_MONTH_TOTAL_BYTES > $FLOW_MONTHLY_LIMIT_BYTES" | bc)" -eq 1 ]; then
-  
-  # 如果是因为错误触发的，日志会显示上面的 CRITICAL ERROR
-  echo "${CURRENT_TIME}: 流量已超过限制量（或发生获取错误），配置 UFW 阻断流量..."
-
-  # 检查是否需要重置 (防止重复重置)
-  ALLOW_PORTS=$(ufw status | grep ALLOW | awk '{print $1}')
-  NEED_RESET=0
-  for port in $ALLOW_PORTS; do
-    clean_port=$(echo "$port" | sed 's/[^0-9]*//g')
-    if [ "$clean_port" != "20" ] && [ "$clean_port" != "21" ] && [ "$clean_port" != "22" ]; then
-      NEED_RESET=1
-      break
-    fi
-  done
-  
-  if [ "$NEED_RESET" -eq 1 ]; then
-      echo "${CURRENT_TIME}: 检测到非标准规则，执行防火墙重置..."
-      yes | sudo ufw reset
   fi
 
-  sudo ufw --force enable
-  sudo ufw allow 20/tcp
-  sudo ufw allow 21/tcp
-  sudo ufw allow 22/tcp
-  
-  # 禁止出站流量 (防止继续跑流量)
-  sudo ufw default deny incoming
-  sudo ufw default deny outgoing
-  sudo ufw reload
+  # Rule 1 must always permit new SSH connections. Managed deny rules are
+  # inserted immediately after it, ahead of unrelated user allow rules.
+  ensure_ssh_rule
+  ensure_block_rule in 2 "$BLOCK_IN_COMMENT"
+  ensure_block_rule out 3 "$BLOCK_OUT_COMMENT"
 
-  echo "${CURRENT_TIME}: UFW 已配置为阻断模式 (仅保留 SSH/FTP)"
+  if ! ufw_is_active; then
+    run_ufw --force enable || die "failed to enable UFW"
+  fi
 
+  log "block mode active: TCP port $SSH_PORT remains allowed; new non-SSH inbound and outbound traffic is denied"
+}
+
+leave_block_mode() {
+  local prior_state=""
+
+  ensure_ssh_rule
+  delete_managed_rule in "$BLOCK_IN_COMMENT"
+  delete_managed_rule out "$BLOCK_OUT_COMMENT"
+
+  prior_state=$(read_prior_state 2>/dev/null || true)
+  if [[ $prior_state == 0 ]] && ufw_is_active; then
+    run_ufw --force disable || die "failed to restore the previous inactive UFW state"
+  fi
+
+  if ((!DRY_RUN)); then
+    rm -f "$STATE_FILE" || die "failed to remove state file"
+  fi
+  log "normal mode active: managed block rules removed; unrelated UFW rules preserved"
+}
+
+detect_interface() {
+  local detected=""
+
+  if command -v ip >/dev/null 2>&1; then
+    detected=$(ip -o route show default 2>/dev/null |
+      awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
+  fi
+  [[ -n $detected ]] || return 1
+  printf '%s\n' "$detected"
+}
+
+get_monthly_total_bytes() {
+  local raw rc
+  local -a fields
+  local current_month
+
+  command -v vnstat >/dev/null 2>&1 || {
+    TRAFFIC_ERROR="vnstat is not installed"
+    return 1
+  }
+
+  raw=$(LC_ALL=C vnstat --oneline b -i "$INTERFACE" 2>&1)
+  rc=$?
+
+  if [[ $raw == *"Not enough data available yet"* ]]; then
+    FLOW_MONTH_TOTAL_READABLE="0 B (vnStat has insufficient data)"
+    FLOW_MONTH_TOTAL_BYTES=0
+    return 0
+  fi
+  if ((rc != 0)); then
+    TRAFFIC_ERROR="vnstat failed for interface '$INTERFACE': $raw"
+    return 1
+  fi
+
+  IFS=';' read -r -a fields <<<"$raw"
+  if ((${#fields[@]} < 15)); then
+    TRAFFIC_ERROR="unexpected vnstat oneline output: $raw"
+    return 1
+  fi
+
+  current_month=$(date '+%Y-%m')
+  if [[ ${fields[7]} != "$current_month" || ! ${fields[10]} =~ ^[0-9]+$ ]]; then
+    TRAFFIC_ERROR="vnstat current-month fields are invalid: $raw"
+    return 1
+  fi
+
+  FLOW_MONTH_TOTAL_READABLE="${fields[10]} B"
+  FLOW_MONTH_TOTAL_BYTES=${fields[10]}
+}
+
+if [[ -z $INTERFACE ]]; then
+  INTERFACE=$(detect_interface) || {
+    INTERFACE="<undetected>"
+    TRAFFIC_ERROR="unable to detect the default-route interface"
+  }
+fi
+
+TRAFFIC_ERROR=${TRAFFIC_ERROR:-}
+FLOW_MONTH_TOTAL_READABLE=""
+FLOW_MONTH_TOTAL_BYTES=""
+
+if [[ -z $TRAFFIC_ERROR ]]; then
+  get_monthly_total_bytes || true
+fi
+
+if [[ -n $TRAFFIC_ERROR || ! $FLOW_MONTH_TOTAL_BYTES =~ ^[0-9]+$ ]]; then
+  [[ -n $TRAFFIC_ERROR ]] || TRAFFIC_ERROR="monthly traffic value is invalid"
+  log "CRITICAL: $TRAFFIC_ERROR"
+  log "fail-safe decision: entering block mode"
+  enter_block_mode
+  exit 2
+fi
+
+log "interface=$INTERFACE monthly_total=${FLOW_MONTH_TOTAL_READABLE} limit=${FLOW_MONTHLY_LIMIT_BYTES} B"
+
+if ((FLOW_MONTH_TOTAL_BYTES > FLOW_MONTHLY_LIMIT_BYTES)); then
+  log "monthly traffic exceeds the limit"
+  enter_block_mode
 else
-
-  echo "${CURRENT_TIME}: 流量正常 (未超标)，关闭防火墙限制"
-  sudo ufw --force disable
-
+  log "monthly traffic is within the limit"
+  leave_block_mode
 fi
