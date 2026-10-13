@@ -172,7 +172,10 @@ run_ufw() {
 
 ensure_ssh_rule() {
   if ! ufw_rule_exists "$SSH_COMMENT"; then
-    # This rule is added before any deny rule and retained permanently.
+    # UFW skips adding a commented rule when an equivalent uncommented
+    # "allow 22/tcp" already exists. Remove that broad duplicate first so the
+    # mandatory keepalive rule can be placed at the very top.
+    run_ufw --force delete allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
     run_ufw prepend allow in proto tcp to any port "$SSH_PORT" \
       comment "$SSH_COMMENT" ||
       die "failed to install the mandatory TCP port $SSH_PORT allow rule"
