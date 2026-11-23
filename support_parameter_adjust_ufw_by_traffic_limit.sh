@@ -10,7 +10,9 @@
 #   install -m 0755 support_parameter_adjust_ufw_by_traffic_limit.sh /usr/local/sbin/traffic-limit-ufw.sh
 #   /usr/local/sbin/traffic-limit-ufw.sh --interface eth0 --upload-limit 180g --dry-run
 #   /usr/local/sbin/traffic-limit-ufw.sh --interface eth0 --upload-limit 180g
-# Run the last command every five minutes using one scheduler. An existing
+#   /usr/local/sbin/traffic-limit-ufw.sh --unlock-current-month
+#   /usr/local/sbin/traffic-limit-ufw.sh --interface eth0 --upload-limit 180g --resume-monitoring
+# Run the normal quota command every five minutes using one scheduler. An existing
 # traffic-limit-ufw.service may already provide that loop; check it before
 # adding cron. Replace eth0 and the limit with your server's settings.
 #
@@ -43,6 +45,16 @@
 # - A vnStat read/parse failure selects block mode and exits with status 2.
 #   --dry-run skips firewall/account edits but still creates the state
 #   directory and lock file.
+# - --unlock-current-month disables UFW completely for the server-local
+#   calendar month, including any unrelated firewall restrictions. It does
+#   not reset vnStat counters or stop the monitor/report services. Preserve
+#   /var/lib/traffic-limit-ufw/month-unlock so scheduled checks honor it.
+#   Repeating the command in the same month keeps the original UFW snapshot.
+# - At the first scheduled check in the next month (normally within five
+#   minutes), or with --resume-monitoring, the snapshot is restored and the
+#   usual quota decision runs. Use your normal interface/limits when resuming;
+#   this one-shot command does not change the scheduler's configuration.
+#   An unlock also bypasses vnStat errors until it expires or is cancelled.
 #
 # Cron examples:
 # */5 * * * * /bin/bash /root/support_parameter_adjust_ufw_by_traffic_limit.sh -u 100g > /root/traffic_limit.log 2>&1
@@ -55,6 +67,7 @@ readonly DEFAULT_FLOW_LIMIT_GIB=180
 readonly SSH_PORT=22
 readonly STATE_DIR="${TRAFFIC_LIMIT_STATE_DIR:-/var/lib/traffic-limit-ufw}"
 readonly STATE_FILE="${STATE_DIR}/state"
+readonly MONTH_UNLOCK_FILE="${STATE_DIR}/month-unlock"
 readonly LOCK_FILE="${TRAFFIC_LIMIT_LOCK_FILE:-/run/lock/traffic-limit-ufw.lock}"
 readonly SSH_COMMENT="traffic-limit:ssh-keepalive"
 readonly BLOCK_IN_COMMENT="traffic-limit:block-in"
@@ -67,6 +80,8 @@ DOWNLOAD_LIMIT_BYTES=""
 TOTAL_LIMIT_BYTES=""
 LIMIT_OPTION_SEEN=0
 DRY_RUN=0
+UNLOCK_CURRENT_MONTH=0
+RESUME_MONITORING=0
 
 log() {
   printf '%s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$*"
@@ -93,12 +108,18 @@ Options:
   -i, --interface NAME    Network interface monitored by vnStat. Defaults to
                           the interface carrying the default route.
       --dry-run           Report the decision without changing UFW.
+      --unlock-current-month
+                          Disable UFW for this server-local calendar month.
+                          Scheduled quota checks resume next month.
+      --resume-monitoring Cancel a monthly unlock and check the quota now.
   -h, --help              Show this help.
 
 Limit values are positive integers with an optional B/K/M/G/T, KB/MB/GB/TB,
 or KiB/MiB/GiB/TiB suffix. Units are binary; a value without a suffix is GiB.
 Only explicitly supplied limit types are enabled. If no limit is supplied,
 the backward-compatible default total limit is 180 GiB.
+Monthly unlocks do not reset usage or stop the monitoring service. UFW is
+disabled entirely while unlocked. Resume with your usual interface/limits.
 EOF
 }
 
@@ -163,6 +184,14 @@ while (($# > 0)); do
       DRY_RUN=1
       shift
       ;;
+    --unlock-current-month)
+      UNLOCK_CURRENT_MONTH=1
+      shift
+      ;;
+    --resume-monitoring)
+      RESUME_MONITORING=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -172,6 +201,9 @@ while (($# > 0)); do
       ;;
   esac
 done
+
+((UNLOCK_CURRENT_MONTH == 0 || RESUME_MONITORING == 0)) ||
+  die "--unlock-current-month and --resume-monitoring cannot be used together"
 
 if ((LIMIT_OPTION_SEEN == 0)); then
   TOTAL_LIMIT_BYTES=$(convert_to_bytes "${DEFAULT_FLOW_LIMIT_GIB}G") ||
@@ -186,10 +218,15 @@ mkdir -p "$STATE_DIR" || die "cannot create state directory '$STATE_DIR'"
 chmod 700 "$STATE_DIR" || die "cannot protect state directory '$STATE_DIR'"
 
 exec 9>"$LOCK_FILE" || die "cannot open lock file '$LOCK_FILE'"
-if ! flock -n 9; then
+if ((UNLOCK_CURRENT_MONTH || RESUME_MONITORING)); then
+  flock -w 30 9 || die "another instance is running; retry the command"
+elif ! flock -n 9; then
   log "another instance is running; skipping this invocation"
   exit 0
 fi
+readonly CURRENT_MONTH=$(date '+%Y-%m')
+[[ $CURRENT_MONTH =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]] ||
+  die "cannot determine the current calendar month"
 
 ufw_is_active() {
   LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active$'
@@ -403,6 +440,61 @@ read_prior_state() {
   esac
 }
 
+read_month_unlock() {
+  local -a lines
+  [[ -f $MONTH_UNLOCK_FILE ]] || return 1
+  mapfile -t lines <"$MONTH_UNLOCK_FILE" || return 1
+  ((${#lines[@]} == 2)) || return 1
+  [[ ${lines[0]} =~ ^month=([0-9]{4}-(0[1-9]|1[0-2]))$ ]] || return 1
+  MONTH_UNLOCK_MONTH=${BASH_REMATCH[1]}
+  [[ ${lines[1]} =~ ^ufw_was_active=([01])$ ]] || return 1
+  MONTH_UNLOCK_PRIOR_STATE=${BASH_REMATCH[1]}
+}
+
+write_month_unlock() {
+  local was_active=$1
+  local temporary="${MONTH_UNLOCK_FILE}.tmp.$$"
+
+  # Persist the snapshot before disabling UFW, so an interrupted command
+  # can be retried without recording the temporary inactive state.
+  printf 'month=%s\nufw_was_active=%s\n' "$CURRENT_MONTH" "$was_active" >"$temporary" ||
+    die "cannot write monthly unlock"
+  chmod 600 "$temporary" || die "cannot protect monthly unlock"
+  mv -f "$temporary" "$MONTH_UNLOCK_FILE" || die "cannot install monthly unlock"
+}
+
+apply_month_unlock() {
+  if ufw_is_active; then
+    run_ufw --force disable || die "failed to disable UFW for the current month"
+  fi
+  delete_managed_rule in "$BLOCK_IN_COMMENT"
+  delete_managed_rule out "$BLOCK_OUT_COMMENT"
+  if ((!DRY_RUN)); then
+    rm -f "$STATE_FILE" || die "failed to remove prior quota block state"
+  fi
+  log "monthly unlock active for $CURRENT_MONTH: UFW disabled; quota monitoring resumes next month"
+}
+
+restore_month_unlock() {
+  # Repair exemptions before re-enabling an originally active firewall.
+  # Keep the marker until all restoration commands succeed.
+  ensure_ssh_rule
+  delete_managed_rule in "$BLOCK_IN_COMMENT"
+  delete_managed_rule out "$BLOCK_OUT_COMMENT"
+  ensure_dingtalk_access
+  if [[ $MONTH_UNLOCK_PRIOR_STATE == 1 ]]; then
+    if ! ufw_is_active; then
+      run_ufw --force enable || die "failed to restore the previous active UFW state"
+    fi
+  elif ufw_is_active; then
+    run_ufw --force disable || die "failed to restore the previous inactive UFW state"
+  fi
+  if ((!DRY_RUN)); then
+    rm -f "$STATE_FILE" "$MONTH_UNLOCK_FILE" || die "failed to clear the monthly unlock"
+  fi
+  log "monthly unlock for $MONTH_UNLOCK_MONTH ended; checking $CURRENT_MONTH quota"
+}
+
 enter_block_mode() {
   local was_active=0
 
@@ -463,7 +555,6 @@ detect_interface() {
 get_monthly_usage_bytes() {
   local raw rc
   local -a fields
-  local current_month
 
   command -v vnstat >/dev/null 2>&1 || {
     TRAFFIC_ERROR="vnstat is not installed"
@@ -491,8 +582,7 @@ get_monthly_usage_bytes() {
     return 1
   fi
 
-  current_month=$(date '+%Y-%m')
-  if [[ ${fields[7]} != "$current_month" ||
+  if [[ ${fields[7]} != "$CURRENT_MONTH" ||
         ! ${fields[8]} =~ ^[0-9]+$ ||
         ! ${fields[9]} =~ ^[0-9]+$ ||
         ! ${fields[10]} =~ ^[0-9]+$ ]]; then
@@ -504,6 +594,39 @@ get_monthly_usage_bytes() {
   MONTHLY_UPLOAD_BYTES=${fields[9]}
   MONTHLY_TOTAL_BYTES=${fields[10]}
 }
+
+# Check the override before vnStat: even a failed usage read must not undo
+# a requested unlock. A marker from any other month never bypasses quota.
+MONTH_UNLOCK_MONTH=""
+MONTH_UNLOCK_PRIOR_STATE=""
+if read_month_unlock; then
+  if [[ $MONTH_UNLOCK_MONTH != "$CURRENT_MONTH" ]] || ((RESUME_MONITORING)); then
+    restore_month_unlock
+  else
+    apply_month_unlock
+    exit 0
+  fi
+elif [[ -e $MONTH_UNLOCK_FILE ]]; then
+  log "WARNING: invalid monthly unlock ignored; normal quota checks continue"
+  if ((!DRY_RUN)); then
+    rm -f "$MONTH_UNLOCK_FILE" || die "cannot remove invalid monthly unlock"
+  fi
+fi
+
+if ((UNLOCK_CURRENT_MONTH)); then
+  prior_state=$(read_prior_state 2>/dev/null || true)
+  if [[ -z $prior_state ]]; then
+    prior_state=0
+    ufw_is_active && prior_state=1
+  fi
+  if ((DRY_RUN)); then
+    log "DRY-RUN: would record monthly unlock for $CURRENT_MONTH with prior UFW active state $prior_state"
+  else
+    write_month_unlock "$prior_state"
+  fi
+  apply_month_unlock
+  exit 0
+fi
 
 if [[ -z $INTERFACE ]]; then
   INTERFACE=$(detect_interface) || {

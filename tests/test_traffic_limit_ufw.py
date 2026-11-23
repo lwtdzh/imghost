@@ -9,6 +9,7 @@ Live UFW commands and account lookups are stubbed. The script's real
 iptables-restore --test calls validate syntax without applying any rules.
 """
 import gettext
+import datetime
 import os
 from pathlib import Path
 import shutil
@@ -54,9 +55,13 @@ def shim():
     if args == ["status"]:
         print("Status: " + (root / "status").read_text())
     elif args == ["--force", "enable"]:
+        if os.environ.get("UFW_TEST_FAIL_ENABLE"):
+            raise SystemExit("Injected enable failure")
         (root / "status").write_text("active")
         print("Fixture firewall enabled")
     elif args == ["--force", "disable"]:
+        if os.environ.get("UFW_TEST_FAIL_DISABLE"):
+            raise SystemExit("Injected disable failure")
         (root / "status").write_text("inactive")
         print("Fixture firewall disabled")
     elif os.environ.get("UFW_TEST_SKIP_SSH") and args[:2] == ["prepend", "allow"]:
@@ -103,6 +108,8 @@ def main(source_path):
             (root / "etc/default/ufw").write_text(defaults)
             (root / "status").write_text(initial_status)
             (root / "tx").write_text("200")
+            (root / "month").write_text(datetime.date.today().strftime("%Y-%m"))
+            (root / "vnstat-calls").touch()
             (root / "commands").touch()
             (root / "bin").mkdir()
             (root / "resolv.conf").write_text(
@@ -117,11 +124,20 @@ def main(source_path):
             )
             (root / "bin/vnstat").write_text(
                 "#!/usr/bin/python3\n"
-                "import datetime, os\nfrom pathlib import Path\n"
-                "month=datetime.date.today().strftime('%Y-%m')\n"
-                "tx=int((Path(os.environ['UFW_TEST_ROOT'])/'tx').read_text())\n"
+                "import os\nfrom pathlib import Path\n"
+                "root=Path(os.environ['UFW_TEST_ROOT'])\n"
+                "with (root/'vnstat-calls').open('a') as stream: stream.write('read\\n')\n"
+                "if (root/'vnstat-fail').exists(): raise SystemExit('Injected vnStat error')\n"
+                "month=(root/'month').read_text()\n"
+                "tx=int((root/'tx').read_text())\n"
                 "print(';'.join(['1','eth0','day','1','1','2','0',month,"
                 "'1',str(tx),str(tx+1),'0','1','1','2']))\n"
+            )
+            (root / "bin/date").write_text(
+                "#!/bin/sh\n"
+                'if [ "$1" = "+%Y-%m" ]; then\n'
+                '  /bin/cat "$UFW_TEST_ROOT/month"\n'
+                'else\n  exec /bin/date "$@"\nfi\n'
             )
             for executable in (root / "bin").iterdir():
                 executable.chmod(0o755)
@@ -226,6 +242,138 @@ def main(source_path):
             run()
             check(True)
             print(f"PASS {name}: dry-run, block, repeat, restore, repeat, block again")
+
+            marker = root / "state/month-unlock"
+            quota_state = root / "state/state"
+            (root / "month").write_text("2026-11")
+
+            def snapshot():
+                paths = [
+                    root / "etc/ufw" / filename for filename in
+                    ("user.rules", "user6.rules", "before.rules", "before6.rules")
+                ] + [root / "status", quota_state, marker]
+                return {str(p): p.read_bytes() if p.exists() else None for p in paths}
+
+            saved = snapshot()
+            run("--unlock-current-month", "--dry-run")
+            assert snapshot() == saved
+            run("--unlock-current-month", "--resume-monitoring", expected=1)
+            assert snapshot() == saved
+            # Opening an active quota block must remember the pre-quota
+            # state, not the active state caused by the quota itself.
+            if initial_status == "active":
+                run("--unlock-current-month", expected=1,
+                    extra_env={"UFW_TEST_FAIL_DISABLE": "1"})
+                assert marker.exists() and quota_state.exists()
+                assert (root / "status").read_text() == "active"
+            run("--unlock-current-month")
+            check(False)
+            expected_marker = (
+                f"month=2026-11\nufw_was_active={int(initial_status == 'active')}\n"
+            )
+            assert marker.read_text() == expected_marker
+            assert marker.stat().st_mode & 0o777 == 0o600
+            assert not quota_state.exists()
+            assert (root / "status").read_text() == "inactive"
+            assert (root / "tx").read_text() == "200"
+            (root / "vnstat-fail").touch()
+            (root / "vnstat-calls").write_text("")
+            run()
+            run("--unlock-current-month")
+            assert marker.read_text() == expected_marker
+            assert not (root / "vnstat-calls").read_text()
+            (root / "status").write_text("active")
+            saved = snapshot()
+            run("--dry-run")
+            assert snapshot() == saved
+            run()
+            assert (root / "status").read_text() == "inactive"
+            (root / "vnstat-fail").unlink()
+            # December's fresh vnStat monthly counter below threshold
+            # restores the original firewall state, then checks the quota.
+            (root / "month").write_text("2026-12")
+            (root / "tx").write_text("1")
+            saved = snapshot()
+            run("--dry-run")
+            assert snapshot() == saved
+            if initial_status == "active":
+                run(expected=1, extra_env={"UFW_TEST_FAIL_ENABLE": "1"})
+                assert marker.exists()
+                assert (root / "status").read_text() == "inactive"
+            run()
+            check(False)
+            assert not marker.exists() and not quota_state.exists()
+            assert (root / "status").read_text() == initial_status
+            # A later December quota violation must still block.
+            (root / "tx").write_text("200")
+            run()
+            check(True)
+            assert quota_state.read_text().strip() == f"ufw_was_active={int(initial_status == 'active')}"
+            run("--unlock-current-month")
+            assert marker.read_text().startswith("month=2026-12\n")
+            # December -> January expiry while already over quota.
+            (root / "month").write_text("2027-01")
+            run()
+            check(True)
+            assert not marker.exists()
+            assert quota_state.read_text().strip() == f"ufw_was_active={int(initial_status == 'active')}"
+            run("--unlock-current-month")
+            saved = snapshot()
+            run("--resume-monitoring", "--dry-run")
+            assert snapshot() == saved
+            run("--resume-monitoring")
+            check(True)
+            assert not marker.exists()
+            # Cancellation also restores correctly below quota.
+            run("--unlock-current-month")
+            (root / "tx").write_text("1")
+            run("--resume-monitoring")
+            check(False)
+            assert (root / "status").read_text() == initial_status
+            assert not marker.exists() and not quota_state.exists()
+            # An unlock before any quota block snapshots current UFW state.
+            run("--unlock-current-month")
+            assert marker.read_text() == (
+                f"month=2027-01\nufw_was_active={int(initial_status == 'active')}\n"
+            )
+            (root / "month").write_text("2027-02")
+            (root / "vnstat-fail").touch()
+            run(expected=2)
+            check(True)
+            assert not marker.exists()
+            assert quota_state.read_text().strip() == f"ufw_was_active={int(initial_status == 'active')}"
+            (root / "vnstat-fail").unlink()
+            (root / "tx").write_text("1")
+            run()
+            # Corrupt files must never provide a quota bypass or execute
+            # contents. Dry-run preserves even malformed files.
+            for invalid in (
+                "", "month=2027-02\n", "month=2027-13\nufw_was_active=0\n",
+                "month=2027-02\nufw_was_active=2\n",
+                "month=2027-02\nufw_was_active=0\nextra=yes\n",
+                f"month=2027-02\nufw_was_active=$(touch {root / 'injected'})\n",
+            ):
+                marker.write_text(invalid)
+                (root / "tx").write_text("200")
+                saved = snapshot()
+                run("--dry-run")
+                assert snapshot() == saved
+                run()
+                check(True)
+                assert not marker.exists() and not (root / "injected").exists()
+                (root / "tx").write_text("1")
+                run()
+            # Reissuing after expiry starts a new monthly unlock with the
+            # original snapshot, even if UFW used to be active.
+            run("--unlock-current-month")
+            (root / "month").write_text("2027-03")
+            run("--unlock-current-month")
+            assert marker.read_text() == (
+                f"month=2027-03\nufw_was_active={int(initial_status == 'active')}\n"
+            )
+            run("--resume-monitoring")
+            assert (root / "status").read_text() == initial_status
+            print(f"PASS {name}: monthly unlock, repeat, dry-run, expiry, year rollover, cancel, vnStat failure, malformed state")
     print("PASS: activation refused when SSH installation does not produce safe rule order")
     print("All tests used isolated rule files; no live firewall rules or accounts were changed.")
 
