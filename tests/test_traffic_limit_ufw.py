@@ -19,12 +19,14 @@ import sys
 import tempfile
 
 gettext.install("ufw")
+import ufw.applications
 import ufw.backend_iptables
 import ufw.common
 import ufw.frontend
 import ufw.util
 
 ufw.common.do_checks = False
+ufw.applications.get_profiles = lambda _: {}
 ufw.util.get_iptables_version = lambda _: "1.8.9"
 ufw.backend_iptables.UFWBackendIptables.is_enabled = lambda self: False
 
@@ -64,7 +66,7 @@ def shim():
             raise SystemExit("Injected disable failure")
         (root / "status").write_text("inactive")
         print("Fixture firewall disabled")
-    elif os.environ.get("UFW_TEST_SKIP_SSH") and args[:2] == ["prepend", "allow"]:
+    elif os.environ.get("UFW_TEST_SKIP_SSH") and "allow" in args and "22" in args:
         print("Injected successful command without installing SSH")
     else:
         print(execute(root, args))
@@ -73,6 +75,7 @@ def shim():
 def main(source_path):
     source = Path(source_path).read_text()
     harness = Path(__file__).resolve()
+    live_rules_dir = Path(ufw.frontend.UFWFrontend(True).backend.files["rules"]).parent
     scenarios = [
         ("empty", [], [], "inactive", True),
         ("ssh-only", ["allow 22/tcp"], ["allow 22/tcp"], "inactive", True),
@@ -102,6 +105,12 @@ def main(source_path):
             root = Path(temporary)
             (root / "etc/default").mkdir(parents=True)
             shutil.copytree("/etc/ufw", root / "etc/ufw")
+            # Follow the installed UFW package's metadata on both Debian
+            # and RPM distributions, keeping every write in this fixture.
+            rules_dir = root / live_rules_dir.relative_to("/")
+            rules_dir.mkdir(parents=True, exist_ok=True)
+            for filename in ("user.rules", "user6.rules"):
+                shutil.copy2(live_rules_dir / filename, rules_dir / filename)
             defaults = Path("/etc/default/ufw").read_text()
             if not ipv6:
                 defaults = defaults.replace("IPV6=yes", "IPV6=no")
@@ -142,6 +151,20 @@ def main(source_path):
             for executable in (root / "bin").iterdir():
                 executable.chmod(0o755)
             test_source = source.replace("/etc/ufw/", str(root / "etc/ufw") + "/")
+            # Embedded metadata helpers run in separate Python processes.
+            # Apply the same fixture settings there: no application profile
+            # rules are used, and real-file ownership checks are irrelevant.
+            # The real parser, rule writer and restore --test stay enabled.
+            test_source = test_source.replace(
+                "from ufw.frontend import UFWFrontend",
+                "import ufw.applications\nimport ufw.common\n"
+                "ufw.applications.get_profiles = lambda _: {}\n"
+                "ufw.common.do_checks = False\n"
+                "from ufw.frontend import UFWFrontend",
+            )
+            test_source = test_source.replace(
+                "UFWFrontend(True)", f'UFWFrontend(True, datadir="{root}")'
+            )
             test_source = test_source.replace("/etc/default/ufw", str(root / "etc/default/ufw"))
             test_source = test_source.replace("/etc/resolv.conf", str(root / "resolv.conf"))
             test_source = test_source.replace("/run/systemd/resolve/resolv.conf", str(root / "missing-resolv.conf"))
@@ -193,7 +216,7 @@ def main(source_path):
                     remaining = [r.format_rule() for r in rules if "traffic-limit:" not in comment(r)]
                     assert remaining == unrelated[index], (name, remaining, unrelated[index])
 
-            before = [(root / "etc/ufw" / f).read_bytes() for f in ("user.rules", "user6.rules")]
+            before = [(rules_dir / f).read_bytes() for f in ("user.rules", "user6.rules")]
             before_output = {
                 filename: re.sub(
                     r"(?m)^# BEGIN traffic-limit:dingtalk-egress\n.*?^# END traffic-limit:dingtalk-egress\n",
@@ -202,7 +225,7 @@ def main(source_path):
                 for filename in ("before.rules", "before6.rules")
             }
             run("--dry-run")
-            assert before == [(root / "etc/ufw" / f).read_bytes() for f in ("user.rules", "user6.rules")]
+            assert before == [(rules_dir / f).read_bytes() for f in ("user.rules", "user6.rules")]
             assert not (root / "state/state").exists()
             if name == "empty":
                 run(expected=1, extra_env={"UFW_TEST_SKIP_SSH": "1"})
@@ -227,10 +250,12 @@ def main(source_path):
             state = (root / "state/state").read_text()
             assert state.strip() == f"ufw_was_active={int(initial_status == 'active')}"
             (root / "commands").write_text("")
-            run()
+            repeated = run()
             check(True)
             calls = (root / "commands").read_text().splitlines()
-            assert all(c in ("show added", "status") for c in calls), (name, calls)
+            assert all(c in ("show added", "status") for c in calls), (
+                name, calls, repeated.stdout, repeated.stderr
+            )
             (root / "tx").write_text("1")
             run()
             check(False)
@@ -249,8 +274,9 @@ def main(source_path):
 
             def snapshot():
                 paths = [
-                    root / "etc/ufw" / filename for filename in
-                    ("user.rules", "user6.rules", "before.rules", "before6.rules")
+                    rules_dir / filename for filename in ("user.rules", "user6.rules")
+                ] + [
+                    root / "etc/ufw" / filename for filename in ("before.rules", "before6.rules")
                 ] + [root / "status", quota_state, marker]
                 return {str(p): p.read_bytes() if p.exists() else None for p in paths}
 

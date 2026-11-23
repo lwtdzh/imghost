@@ -238,12 +238,14 @@ readonly CURRENT_MONTH=$(date '+%Y-%m')
   die "cannot determine the current calendar month"
 
 ufw_is_active() {
-  LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active$'
+  LC_ALL=C ufw status 2>/dev/null | grep '^Status: active$' >/dev/null
 }
 
 ufw_rule_exists() {
   local marker=$1
-  LC_ALL=C ufw show added 2>/dev/null | grep -Fq "comment '$marker'"
+  # Consume all output: grep -q can close the pipe early and make UFW
+  # fail with SIGPIPE, which pipefail would misread as a missing rule.
+  LC_ALL=C ufw show added 2>/dev/null | grep -F "comment '$marker'" >/dev/null
 }
 
 run_ufw() {
@@ -257,11 +259,24 @@ run_ufw() {
 }
 
 ssh_rules_are_first() {
-  local rules_file chain first_rule
-  local -a rule_files=(/etc/ufw/user.rules)
+  local rules_dir rules_file chain first_rule
+  # Read UFW's configured location: Debian uses /etc/ufw, while RPM
+  # packages can keep user rules in /var/lib/ufw.
+  rules_dir=$(python3 - <<'PY'
+import gettext
+from pathlib import Path
+import shutil
+import sys
+gettext.install("ufw")
+from ufw.frontend import UFWFrontend
+sys.argv[0] = shutil.which("ufw")
+print(Path(UFWFrontend(True).backend.files["rules"]).parent)
+PY
+  ) || return 1
+  local -a rule_files=("$rules_dir/user.rules")
 
   if grep -Eq "^[[:space:]]*IPV6[[:space:]]*=[[:space:]]*['\"]?yes['\"]?([[:space:]]*(#.*)?)?$" /etc/default/ufw; then
-    rule_files+=(/etc/ufw/user6.rules)
+    rule_files+=("$rules_dir/user6.rules")
   fi
 
   for rules_file in "${rule_files[@]}"; do
@@ -274,13 +289,43 @@ ssh_rules_are_first() {
   done
 }
 
+prepend_ufw_rule() {
+  if ((DRY_RUN)); then
+    run_ufw prepend "$@"
+    return
+  fi
+  # Older UFW packages have no "prepend". Insert each IP family at its
+  # own first position, using explicit addresses to avoid UFW's automatic
+  # IPv4/IPv6 position matching. An empty family needs a plain append.
+  python3 - "$@" <<'PY'
+import gettext
+import shutil
+import subprocess
+import sys
+gettext.install("ufw")
+from ufw.frontend import UFWFrontend
+arguments = sys.argv[1:]
+sys.argv[0] = shutil.which("ufw")
+for ipv6, address in ((False, "0.0.0.0/0"), (True, "::/0")):
+    backend = UFWFrontend(True).backend
+    if ipv6 and not backend.use_ipv6():
+        continue
+    command = ["ufw"]
+    if backend.get_rules_count(ipv6):
+        position = backend.get_rules_count(False) + 1 if ipv6 else 1
+        command.extend(["insert", str(position)])
+    command.extend(address if value == "any" else value for value in arguments)
+    subprocess.run(command, check=True)
+PY
+}
+
 ensure_ssh_rule() {
   if ! ufw_rule_exists "$SSH_COMMENT" || ! ssh_rules_are_first; then
     # UFW skips adding a commented rule when an equivalent uncommented
     # "allow 22/tcp" already exists. Remove that broad duplicate first so the
     # mandatory keepalive rule can be placed at the very top.
     run_ufw --force delete allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
-    run_ufw prepend allow in proto tcp to any port "$SSH_PORT" \
+    prepend_ufw_rule allow in proto tcp to any port "$SSH_PORT" \
       comment "$SSH_COMMENT" ||
       die "failed to install the mandatory TCP port $SSH_PORT allow rule"
   fi
@@ -301,7 +346,7 @@ ensure_block_rule() {
     endpoint_keyword=to
   fi
   if ! ufw_rule_exists "$marker"; then
-    run_ufw prepend deny "$direction" "$endpoint_keyword" any \
+    prepend_ufw_rule deny "$direction" "$endpoint_keyword" any \
       comment "$marker" ||
       die "failed to install managed $direction block rule"
   fi

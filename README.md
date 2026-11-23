@@ -13,7 +13,19 @@
 
 [UFW 流量限制脚本](support_parameter_adjust_ufw_by_traffic_limit.sh) 和 [钉钉流量报告脚本](support_parameter_report_traffic_to_dingtalk.sh) 需要一起更新。安装命令、依赖和注意事项写在各自文件开头；钉钉配置见 [.env.example](support_parameter_report_traffic_to_dingtalk.env.example)，真实 token 和 secret 只保存在服务器上。
 
+使用 systemd 定时监控的服务器还需要 [流量监控循环脚本](traffic-limit-ufw-loop.sh)。三份脚本的安装位置如下：
+
+| 仓库文件 | 服务器安装位置 |
+| --- | --- |
+| support_parameter_adjust_ufw_by_traffic_limit.sh | /usr/local/sbin/traffic-limit-ufw.sh |
+| traffic-limit-ufw-loop.sh | /usr/local/sbin/traffic-limit-ufw-loop.sh |
+| support_parameter_report_traffic_to_dingtalk.sh | /usr/local/sbin/traffic-usage-dingtalk-report-loop.sh |
+
+升级时保留 /etc/default/traffic-limit-ufw、/etc/default/traffic-usage-dingtalk-report 和 /var/lib/traffic-limit-ufw，三份脚本安装后再重启两个服务。循环脚本读取原有网卡和上传、下载、总流量限额；不要把临时解锁命令写入循环或 cron，否则下个月也会再次解锁。钉钉服务重启后会立即发送一次报告。
+
 流量超限后，IPv4/IPv6 的 TCP 22 放行规则排在入站拒绝规则之前。出站仍允许访问已配置的 DNS 服务器，以及 traffic-dingtalk 专用用户发起的 HTTPS 请求。这个用户可以访问任意 TCP 443 目的地址，应只供报告脚本使用。SSH、DNS、报告和已有连接产生的流量仍会计入 vnStat。
+
+SSH 规则检查从已安装的 UFW Python backend 读取用户规则目录；Debian 通常使用 /etc/ufw，CentOS 的 RPM 包使用 /var/lib/ufw。规则按 IPv4、IPv6 各自的第一条位置插入，也支持没有 prepend 命令的旧版 UFW。测试跟随实际目录设置，所有规则写入临时目录。
 
 DNS/HTTPS 规则写在 UFW 的 before.rules 和 before6.rules 中，检查时使用 iptables/ip6tables 的 before-output 链；ufw status 不显示这些规则。启用防火墙后，应确认能建立新的 SSH 连接，并检查报告日志里的 “DingTalk report accepted (errcode=0)”。
 
