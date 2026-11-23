@@ -3,7 +3,46 @@
 # Enable a reversible UFW traffic block when the current month's vnStat
 # upload, download, or total usage reaches a configured limit. The script
 # never resets unrelated UFW rules and always installs an IPv4/IPv6 TCP
-# port 22 allow rule first.
+# port 22 allow rule ahead of the deny rules. DNS to configured resolvers
+# and HTTPS from the dedicated DingTalk sender remain available.
+#
+# Usage (Linux, as root):
+#   install -m 0755 support_parameter_adjust_ufw_by_traffic_limit.sh /usr/local/sbin/traffic-limit-ufw.sh
+#   /usr/local/sbin/traffic-limit-ufw.sh --interface eth0 --upload-limit 180g --dry-run
+#   /usr/local/sbin/traffic-limit-ufw.sh --interface eth0 --upload-limit 180g
+# Run the last command every five minutes using one scheduler. An existing
+# traffic-limit-ufw.service may already provide that loop; check it before
+# adding cron. Replace eth0 and the limit with your server's settings.
+#
+# Requirements:
+#   Bash, UFW's iptables backend, vnStat, flock, Python 3, getent, useradd,
+#   id, iptables-restore and ip6tables-restore (including IPv6 kernel support).
+#   Deploy the matching support_parameter_report_traffic_to_dingtalk.sh.
+#
+# Operational cautions:
+# - TCP 22 is allowed inbound from any source. Keep sshd on that port and
+#   check a fresh SSH login after enabling UFW. Other SSH ports need their
+#   own exemption. Back up /etc/ufw and keep console/VNC access available.
+# - UFW's numeric rule positions combine IPv4 and IPv6. Keep the prepend
+#   and SSH-order validation below; adding deny rules at positions 2/3 can
+#   place them ahead of SSH. An existing SSH comment alone proves no order.
+# - DNS allows UDP/TCP 53 to configured resolvers for all local users.
+#   HTTPS allows every TCP 443 destination only for traffic-dingtalk's UID.
+#   Reserve that account for the reporter; other applications using its UID
+#   would also receive the HTTPS exemption. Do not replace it with UID 0.
+# - DNS/HTTPS exceptions are stored in marked blocks in before.rules and
+#   before6.rules. Inspect the before-output chains with iptables/ip6tables
+#   -S; "ufw status" lists user rules and does not display these exceptions.
+# - SSH, DNS and report bytes still count toward vnStat usage. UFW's normal
+#   established-connection rules remain intact, so existing connections can
+#   continue; the quota rules deny new connections.
+# - On quota reset, only managed deny rules are removed and the recorded
+#   UFW active state is restored. SSH/DNS/HTTPS exemptions and the sender
+#   account remain. Preserve /var/lib/traffic-limit-ufw/state while blocked.
+#   Rerun this script after changing the sender UID or DNS configuration.
+# - A vnStat read/parse failure selects block mode and exits with status 2.
+#   --dry-run skips firewall/account edits but still creates the state
+#   directory and lock file.
 #
 # Cron examples:
 # */5 * * * * /bin/bash /root/support_parameter_adjust_ufw_by_traffic_limit.sh -u 100g > /root/traffic_limit.log 2>&1
@@ -20,6 +59,7 @@ readonly LOCK_FILE="${TRAFFIC_LIMIT_LOCK_FILE:-/run/lock/traffic-limit-ufw.lock}
 readonly SSH_COMMENT="traffic-limit:ssh-keepalive"
 readonly BLOCK_IN_COMMENT="traffic-limit:block-in"
 readonly BLOCK_OUT_COMMENT="traffic-limit:block-out"
+readonly DINGTALK_NETWORK_USER="traffic-dingtalk"
 
 INTERFACE="${TRAFFIC_LIMIT_INTERFACE:-}"
 UPLOAD_LIMIT_BYTES=""
@@ -170,22 +210,43 @@ run_ufw() {
   ufw "$@"
 }
 
+ssh_rules_are_first() {
+  local rules_file chain first_rule
+  local -a rule_files=(/etc/ufw/user.rules)
+
+  if grep -Eq "^[[:space:]]*IPV6[[:space:]]*=[[:space:]]*['\"]?yes['\"]?([[:space:]]*(#.*)?)?$" /etc/default/ufw; then
+    rule_files+=(/etc/ufw/user6.rules)
+  fi
+
+  for rules_file in "${rule_files[@]}"; do
+    chain=ufw-user-input
+    [[ $rules_file == */user6.rules ]] && chain=ufw6-user-input
+    first_rule=$(awk -v chain="$chain" '$1 == "-A" && $2 == chain {print; exit}' "$rules_file") ||
+      return 1
+    [[ $first_rule == "-A $chain -p tcp --dport $SSH_PORT -j ACCEPT" ]] ||
+      return 1
+  done
+}
+
 ensure_ssh_rule() {
-  if ! ufw_rule_exists "$SSH_COMMENT"; then
+  if ! ufw_rule_exists "$SSH_COMMENT" || ! ssh_rules_are_first; then
     # UFW skips adding a commented rule when an equivalent uncommented
     # "allow 22/tcp" already exists. Remove that broad duplicate first so the
     # mandatory keepalive rule can be placed at the very top.
     run_ufw --force delete allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
-    run_ufw insert 1 allow in proto tcp to any port "$SSH_PORT" \
+    run_ufw prepend allow in proto tcp to any port "$SSH_PORT" \
       comment "$SSH_COMMENT" ||
       die "failed to install the mandatory TCP port $SSH_PORT allow rule"
+  fi
+
+  if ((!DRY_RUN)) && ! ssh_rules_are_first; then
+    die "TCP port $SSH_PORT must be the first inbound user rule in each enabled IP family"
   fi
 }
 
 ensure_block_rule() {
   local direction=$1
-  local position=$2
-  local marker=$3
+  local marker=$2
   local endpoint_keyword
 
   if [[ $direction == in ]]; then
@@ -194,7 +255,7 @@ ensure_block_rule() {
     endpoint_keyword=to
   fi
   if ! ufw_rule_exists "$marker"; then
-    run_ufw insert "$position" deny "$direction" "$endpoint_keyword" any \
+    run_ufw prepend deny "$direction" "$endpoint_keyword" any \
       comment "$marker" ||
       die "failed to install managed $direction block rule"
   fi
@@ -214,6 +275,110 @@ delete_managed_rule() {
     run_ufw --force delete deny "$direction" "$endpoint_keyword" any \
       comment "$marker" ||
       die "failed to remove managed $direction block rule"
+  fi
+}
+
+ensure_dingtalk_access() {
+  local sender_uid changed
+
+  if ((DRY_RUN)); then
+    log "DRY-RUN: would allow configured DNS resolvers and HTTPS from $DINGTALK_NETWORK_USER in UFW before-output chains"
+    return 0
+  fi
+
+  # Both services may start together. A second passwd lookup also handles
+  # the reporter creating the account between this lookup and useradd.
+  if ! getent passwd "$DINGTALK_NETWORK_USER" >/dev/null; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin "$DINGTALK_NETWORK_USER" ||
+      getent passwd "$DINGTALK_NETWORK_USER" >/dev/null ||
+      die "failed to create the DingTalk sender account"
+  fi
+  sender_uid=$(id -u "$DINGTALK_NETWORK_USER") ||
+    die "cannot find the DingTalk sender UID"
+  [[ $sender_uid =~ ^[0-9]+$ ]] && ((sender_uid > 0)) ||
+    die "the DingTalk sender must use a non-root UID"
+
+  changed=$(python3 - "$sender_uid" <<'PY'
+import ipaddress
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+uid = int(sys.argv[1])
+resolvers = set()
+# The second file supplies upstream resolvers when resolv.conf uses the
+# systemd-resolved loopback stub.
+for name in ("/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"):
+    path = Path(name)
+    if not path.exists():
+        continue
+    for line in path.read_text().splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] == "nameserver":
+            resolvers.add(ipaddress.ip_address(fields[1]))
+if not resolvers:
+    raise SystemExit("No configured DNS resolvers found")
+
+begin = "# BEGIN traffic-limit:dingtalk-egress"
+end = "# END traffic-limit:dingtalk-egress"
+updates = []
+# before-output runs before the user-output blanket deny. The UID match
+# lets the reporter resolve rotating DingTalk addresses without granting
+# HTTPS to the proxy or other normal processes.
+for version, prefix, name, binary in (
+    (4, "ufw", "/etc/ufw/before.rules", "iptables-restore"),
+    (6, "ufw6", "/etc/ufw/before6.rules", "ip6tables-restore"),
+):
+    path = Path(name)
+    old = path.read_text()
+    if old.count(begin) != old.count(end) or old.count(begin) > 1:
+        raise SystemExit(f"Malformed managed DingTalk block in {path}")
+    text = re.sub(
+        rf"(?m)^{re.escape(begin)}\n.*?^{re.escape(end)}\n",
+        "", old, flags=re.DOTALL,
+    )
+    chain = prefix + "-before-output"
+    rules = [
+        begin,
+        f"-A {chain} -p tcp --dport 443 -m owner --uid-owner {uid} -j ACCEPT",
+    ]
+    for resolver in sorted(resolvers, key=str):
+        if resolver.version == version:
+            for protocol in ("udp", "tcp"):
+                rules.append(f"-A {chain} -d {resolver} -p {protocol} --dport 53 -j ACCEPT")
+    rules.append(end)
+    filter_start = text.index("*filter\n") + len("*filter\n")
+    filter_end = text.index("\nCOMMIT", filter_start)
+    first_rule = re.search(r"(?m)^-A ", text[filter_start:filter_end])
+    if first_rule is None:
+        raise SystemExit(f"No filter rules found in {path}")
+    position = filter_start + first_rule.start()
+    new = text[:position] + "\n".join(rules) + "\n" + text[position:]
+    if new != old:
+        # Validate both candidate files before replacing either original.
+        subprocess.run([binary, "--test"], input=new, text=True, check=True)
+        updates.append((path, new))
+
+for path, text in updates:
+    metadata = path.stat()
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as temporary:
+        temporary.write(text)
+        os.fchmod(temporary.fileno(), stat.S_IMODE(metadata.st_mode))
+        os.fchown(temporary.fileno(), metadata.st_uid, metadata.st_gid)
+        temporary_name = temporary.name
+    os.replace(temporary_name, path)
+print(int(bool(updates)))
+PY
+  ) || die "failed to install DingTalk and DNS firewall exceptions"
+
+  # A running UFW needs a reload to apply before-rule edits. Unchanged
+  # files avoid a reload on every scheduled quota check.
+  if [[ $changed == 1 ]] && ufw_is_active; then
+    run_ufw reload || die "failed to load DingTalk and DNS firewall exceptions"
   fi
 }
 
@@ -250,17 +415,19 @@ enter_block_mode() {
     fi
   fi
 
-  # Rule 1 must always permit new SSH connections. Managed deny rules are
-  # inserted immediately after it, ahead of unrelated user allow rules.
+  # UFW numbers IPv4 and IPv6 together, so numeric insert positions can
+  # move a deny ahead of SSH. Prepend the blocks, then repair SSH in each
+  # family, including existing keepalive rules left below an old deny.
+  ensure_block_rule in "$BLOCK_IN_COMMENT"
+  ensure_block_rule out "$BLOCK_OUT_COMMENT"
   ensure_ssh_rule
-  ensure_block_rule in 2 "$BLOCK_IN_COMMENT"
-  ensure_block_rule out 3 "$BLOCK_OUT_COMMENT"
+  ensure_dingtalk_access
 
   if ! ufw_is_active; then
     run_ufw --force enable || die "failed to enable UFW"
   fi
 
-  log "block mode active: TCP port $SSH_PORT remains allowed; new non-SSH inbound and outbound traffic is denied"
+  log "block mode active: SSH, configured DNS and DingTalk sender HTTPS remain allowed; other new traffic is denied"
 }
 
 leave_block_mode() {
@@ -269,6 +436,7 @@ leave_block_mode() {
   ensure_ssh_rule
   delete_managed_rule in "$BLOCK_IN_COMMENT"
   delete_managed_rule out "$BLOCK_OUT_COMMENT"
+  ensure_dingtalk_access
 
   prior_state=$(read_prior_state 2>/dev/null || true)
   if [[ $prior_state == 0 ]] && ufw_is_active; then

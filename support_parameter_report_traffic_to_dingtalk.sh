@@ -2,13 +2,45 @@
 #
 # Report vnStat traffic usage to a DingTalk robot.
 #
-# Recommended systemd usage:
-#   ExecStart=/usr/local/sbin/support_parameter_report_traffic_to_dingtalk.sh
+# Installation (Linux, as root):
+#   install -m 0755 support_parameter_report_traffic_to_dingtalk.sh /usr/local/sbin/traffic-usage-dingtalk-report-loop.sh
+#   # New installations only: copy the .env.example to the config path
+#   # below, set mode 600, and fill in the webhook and signing secret.
+#   # Preserve your existing config when upgrading.
+#
+# Recommended systemd service settings:
+#   User=root
+#   Group=root
+#   ExecStart=/usr/local/sbin/traffic-usage-dingtalk-report-loop.sh
+#   Restart=always
+#   RestartSec=10s
+# Check "systemctl cat traffic-usage-dingtalk-report.service" for the actual
+# installed filename. Deploy both this script and the matching quota script,
+# run the quota check once, then restart the reporter service.
 #
 # Required secret/config values are read from:
 #   /etc/default/traffic-usage-dingtalk-report
 #
 # The script intentionally does not embed DingTalk tokens or secrets.
+#
+# Operational cautions:
+# - Run the service as root for config/counter access. Only curl runs as
+#   the traffic-dingtalk system user; the quota script installs that UID's
+#   TCP 443 exception and DNS exceptions before the outbound deny.
+# - Reserve traffic-dingtalk for this reporter. Its HTTPS exception covers
+#   all TCP 443 destinations. Keep DINGTALK_SECRET and the webhook token in
+#   the root-owned mode-600 config; never commit them or use shell tracing.
+# - curl connects directly (--noproxy '*'). A proxy-only network needs a
+#   corresponding transport/firewall change; proxy variables are ignored.
+# - This is a foreground loop: the first report is sent immediately, then
+#   every INTERVAL_SECONDS (10800 = three hours). Restarting sends another
+#   report. Avoid scheduling a new copy with cron while the service runs.
+# - Each request has a 10-second connection and 30-second total timeout.
+#   Success requires both curl success and DingTalk JSON errcode=0. A
+#   failure is logged with nonzero rc; the loop tries again next interval.
+# - Logs are under /root/traffic-usage-dingtalk-logs/YYYY-MM-DD.log. The loop
+#   removes logs older than three days by modification time. API acceptance
+#   is reported as "DingTalk report accepted (errcode=0)".
 
 set -u
 set -o pipefail
@@ -28,6 +60,14 @@ fi
 : "${UPLOAD_LIMIT_GIB:=180}"
 : "${DOWNLOAD_LIMIT_GIB:=}"
 : "${TOTAL_LIMIT_GIB:=}"
+
+readonly DINGTALK_NETWORK_USER="traffic-dingtalk"
+# Either service can create this account first during boot.
+if ! getent passwd "$DINGTALK_NETWORK_USER" >/dev/null; then
+  useradd --system --no-create-home --shell /usr/sbin/nologin "$DINGTALK_NETWORK_USER" ||
+    getent passwd "$DINGTALK_NETWORK_USER" >/dev/null ||
+    exit 1
+fi
 
 mkdir -p "$LOG_DIR"
 chmod 700 "$LOG_DIR"
@@ -136,6 +176,7 @@ send_report() {
   local upload_remain_text download_remain_text total_remain_text
   local upload_percent download_percent total_percent
   local ufw_state singbox_state auto_ufw_state vnstat_state
+  local response rc
 
   raw=$(LC_ALL=C vnstat --oneline b -i "$TRAFFIC_INTERFACE")
   IFS=';' read -r -a fields <<<"$raw"
@@ -217,8 +258,29 @@ EOF
     "$rx_text" "$download_limit_text" "$download_remain_text" \
     "$total_text" "$total_limit_text" "$total_remain_text" \
     "$singbox_state" "$auto_ufw_state" "$vnstat_state" "$ufw_state"
-  curl -fsS -H 'Content-Type: application/json' -d "$payload" "$signed_url"
-  printf '\n'
+  # Only the network request uses this UID. Reading counters/configuration
+  # and signing the payload still run as root.
+  if response=$(runuser -u "$DINGTALK_NETWORK_USER" -- \
+      curl --noproxy '*' --connect-timeout 10 --max-time 30 \
+      -fsS -H 'Content-Type: application/json' -d "$payload" "$signed_url"); then
+    # HTTP 200 can still carry a DingTalk API error. Return the parser's
+    # status directly so the loop cannot log a failed send as rc=0.
+    printf '%s' "$response" | python3 -c '
+import json
+import sys
+try:
+    result = json.load(sys.stdin)
+except (ValueError, TypeError):
+    sys.exit("ERROR: DingTalk returned invalid JSON")
+if not isinstance(result, dict) or result.get("errcode") != 0:
+    sys.exit("ERROR: DingTalk did not accept the report")
+print("DingTalk report accepted (errcode=0)")
+'
+  else
+    rc=$?
+    printf 'ERROR: DingTalk request failed (curl rc=%s)\n' "$rc" >&2
+    return "$rc"
+  fi
 }
 
 while true; do
