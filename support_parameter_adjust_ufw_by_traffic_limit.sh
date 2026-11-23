@@ -55,6 +55,13 @@
 #   usual quota decision runs. Use your normal interface/limits when resuming;
 #   this one-shot command does not change the scheduler's configuration.
 #   An unlock also bypasses vnStat errors until it expires or is cancelled.
+# - The unlock command does not start a stopped monitor. Keep your scheduler
+#   running throughout the unlock; without checks, expiry cannot restore UFW.
+#   For an already installed systemd guard, check and start it with:
+#     systemctl is-active traffic-limit-ufw.service
+#     systemctl enable --now traffic-limit-ufw.service
+#   Leave the DingTalk reporter running too. UFW being inactive is expected
+#   during the unlock and does not mean the quota monitor has stopped.
 #
 # Cron examples:
 # */5 * * * * /bin/bash /root/support_parameter_adjust_ufw_by_traffic_limit.sh -u 100g > /root/traffic_limit.log 2>&1
@@ -218,6 +225,8 @@ mkdir -p "$STATE_DIR" || die "cannot create state directory '$STATE_DIR'"
 chmod 700 "$STATE_DIR" || die "cannot protect state directory '$STATE_DIR'"
 
 exec 9>"$LOCK_FILE" || die "cannot open lock file '$LOCK_FILE'"
+# An interactive control command waits briefly instead of silently skipping
+# the requested action when a scheduled quota check holds the lock.
 if ((UNLOCK_CURRENT_MONTH || RESUME_MONITORING)); then
   flock -w 30 9 || die "another instance is running; retry the command"
 elif ! flock -n 9; then
@@ -443,6 +452,8 @@ read_prior_state() {
 read_month_unlock() {
   local -a lines
   [[ -f $MONTH_UNLOCK_FILE ]] || return 1
+  # The persisted file contains only month=YYYY-MM and ufw_was_active=0|1.
+  # Parse it as data, never source it; invalid files cannot bypass quota.
   mapfile -t lines <"$MONTH_UNLOCK_FILE" || return 1
   ((${#lines[@]} == 2)) || return 1
   [[ ${lines[0]} =~ ^month=([0-9]{4}-(0[1-9]|1[0-2]))$ ]] || return 1
@@ -614,6 +625,8 @@ elif [[ -e $MONTH_UNLOCK_FILE ]]; then
 fi
 
 if ((UNLOCK_CURRENT_MONTH)); then
+  # A quota block may have enabled a previously inactive UFW. Prefer the
+  # pre-quota snapshot so expiry does not leave that firewall enabled.
   prior_state=$(read_prior_state 2>/dev/null || true)
   if [[ -z $prior_state ]]; then
     prior_state=0

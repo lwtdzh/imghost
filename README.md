@@ -27,6 +27,20 @@ sudo /usr/local/sbin/traffic-limit-ufw.sh --unlock-current-month
 
 放行期间 UFW 整体关闭，因此其他 UFW 规则也暂停生效。脚本不清零 vnStat、不停止监控或报告服务；流量继续累计，vnStat 暂时读取失败也不会取消本月放行。保留服务器上的 /var/lib/traffic-limit-ufw/month-unlock 文件，脚本会在到期或主动恢复时清理它。系统时钟和时区应保持正确。
 
+解锁命令不会启动已停止的监控服务。监控要持续运行，才能在下个月自动恢复检查。对于已安装 systemd 服务的服务器，可以这样确认两个服务都输出 active：
+
+```bash
+systemctl is-active traffic-limit-ufw.service traffic-usage-dingtalk-report.service
+```
+
+如果流量监控没有运行，启动它并设置开机启动：
+
+```bash
+sudo systemctl enable --now traffic-limit-ufw.service
+```
+
+使用 cron 的服务器应保留原来的定时检查，不要再启动另一份监控。放行期间 ufw status 显示 inactive 是正常现象；钉钉报告中的剩余流量可能为零，实际流量仍继续累计。
+
 提前恢复监控时，带上平时使用的网卡和限额，立即按当前流量判断：
 
 ```bash

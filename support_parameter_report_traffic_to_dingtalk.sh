@@ -41,6 +41,10 @@
 # - Logs are under /root/traffic-usage-dingtalk-logs/YYYY-MM-DD.log. The loop
 #   removes logs older than three days by modification time. API acceptance
 #   is reported as "DingTalk report accepted (errcode=0)".
+# - During --unlock-current-month, UFW is intentionally inactive and usage
+#   still accumulates. A zero remaining quota can therefore appear alongside
+#   ufw:inactive in a successful report. Keep both services running; the quota
+#   monitor must check again next month to expire the unlock automatically.
 
 set -u
 set -o pipefail
